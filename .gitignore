@@ -1,0 +1,38 @@
+# Secrets and credentials
+.env
+.env.local
+*.pem
+*.key
+*.crt
+
+# Dependencies
+node_modules/
+
+# Build and generated artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Docker
+.docker/
+
+# OS
+Thumbs.db
