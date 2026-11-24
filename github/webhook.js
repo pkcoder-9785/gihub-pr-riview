@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { buildReviewIdentityKey } from '../review/identity.js';
 
 export const REVIEW_EVENT = 'github/pullrequest.review';
 export const CANCEL_REVIEW_EVENT = 'github/pullrequest.review.cancel';
@@ -55,7 +56,6 @@ export function createWebhookHandler({
   repositories,
   botAuthorAllowlist = [],
   send,
-  fetchPullRequest,
 }) {
   const allowlist = new Set(repositories.map((repository) => repository.toLowerCase()));
 
@@ -81,20 +81,29 @@ export function createWebhookHandler({
     const repository = `${data.owner}/${data.repo}`.toLowerCase();
     if (!allowlist.has(repository)) return ignore();
 
+    const pr = payload.pull_request;
+    if (typeof pr?.head?.sha !== 'string' || typeof pr?.base?.sha !== 'string') {
+      return res.status(400).json({ error: 'Invalid pull request state' });
+    }
+
     const prKey = pullRequestKey(data);
+    const observedAt = typeof pr.updated_at === 'string' ? pr.updated_at : new Date().toISOString();
+
+    let effectivePR = pr;
+    if (payload.action === 'unlabeled' && payload.label?.name?.toLowerCase() === 'skip-ai-review') {
+      effectivePR = {
+        ...pr,
+        labels: (pr.labels || []).filter((l) => l.name?.toLowerCase() !== 'skip-ai-review'),
+      };
+    } else if (payload.action === 'labeled' && payload.label?.name?.toLowerCase() === 'skip-ai-review') {
+      effectivePR = {
+        ...pr,
+        labels: [...(pr.labels || []), { name: 'skip-ai-review' }],
+      };
+    }
+
     try {
-      let current;
-      try {
-        current = await fetchPullRequest(data);
-      } catch (error) {
-        if (error.status === 404) return res.status(202).json({ status: 'ignored' });
-        throw error;
-      }
-
-      if (!current || typeof current !== 'object') throw new Error('GitHub PR lookup failed');
-      const observedAt = typeof current.updated_at === 'string' ? current.updated_at : new Date().toISOString();
-
-      if (optedOut(current, botAuthorAllowlist)) {
+      if (optedOut(effectivePR, botAuthorAllowlist)) {
         await send({
           id: `${data.deliveryId}:cancel`,
           name: CANCEL_REVIEW_EVENT,
@@ -103,25 +112,30 @@ export function createWebhookHandler({
         return res.status(202).json({ status: 'ignored' });
       }
 
-      if (typeof current.head?.sha !== 'string' || typeof current.base?.sha !== 'string') {
-        return res.status(400).json({ error: 'Invalid current pull request state' });
-      }
+      const identityKey = buildReviewIdentityKey({
+        installationId: data.installationId,
+        repositoryId: data.repositoryId,
+        prNumber: data.prNumber,
+        headSha: pr.head.sha,
+        baseSha: pr.base.sha,
+      });
 
       await send({
         id: data.deliveryId,
         name: REVIEW_EVENT,
         data: {
           ...data,
+          identityKey,
           prKey,
-          observedHeadSha: current.head.sha,
-          observedBaseSha: current.base.sha,
+          observedHeadSha: pr.head.sha,
+          observedBaseSha: pr.base.sha,
           observedAt,
           action: payload.action,
         },
       });
       return res.status(202).json({ status: 'accepted' });
     } catch {
-      console.error(JSON.stringify({ category: 'github_webhook_enqueue_or_lookup_failed', deliveryId: data.deliveryId }));
+      console.error(JSON.stringify({ category: 'github_webhook_enqueue_failed', deliveryId: data.deliveryId }));
       return res.status(503).json({ error: 'Webhook could not be queued' });
     }
   };

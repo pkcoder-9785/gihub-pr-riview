@@ -5,7 +5,9 @@ import { collectContext } from '../../review/context.js';
 import { aiClient, reviewAI } from '../../review/ai.js';
 import { UnsupportedTokenizerError } from '../../review/tokenizer.js';
 import { identity, sameSnapshot, classify } from '../../review/safety.js';
+import { buildReviewIdentityKey } from '../../review/identity.js';
 import { findReview, publish } from '../../review/publish.js';
+import { runV3Review } from '../../review/pipeline.js';
 
 function retryDelay(error) {
   const headers = error.response?.headers || {};
@@ -38,6 +40,7 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
     id: 'review-pr',
     triggers: { event: REVIEW_EVENT },
     retries: 3,
+    idempotency: 'event.id',
     debounce: {
       period: '20s',
       timeout: '2m',
@@ -55,6 +58,7 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
     const data = event.data;
     const startedAt = Date.now();
     let activeSnapshot = null;
+    let liveIdentityKey = null;
     const logResult = (status, extra = {}) => {
       console.info(JSON.stringify({
         category: 'review_run',
@@ -89,8 +93,26 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
       if (!initial) return logResult('skipped_ineligible');
       activeSnapshot = { base: initial.base, head: initial.head };
 
+      liveIdentityKey = buildReviewIdentityKey({
+        installationId: data.installationId,
+        repositoryId: data.repositoryId,
+        prNumber: data.prNumber,
+        headSha: initial.head,
+        baseSha: initial.base,
+        configKey: identity(data, initial, config),
+      });
+
+      if (store?.claimRun) {
+        const claim = await step.run('claim-run', () => store.claimRun(liveIdentityKey));
+        if (!claim?.claimed) {
+          return logResult(claim?.reason === 'done' ? 'skipped_already_done' : 'skipped_in_progress');
+        }
+      }
+
       const reviewId = identity(data, initial, config);
-      const result = await step.run('review', async () => {
+      const result = config.review.v3?.enabled ? await runV3Review({
+        step, client, store, config, data, args, snapshot: initial, reviewId, runId, getAI,
+      }) : await step.run('review', async () => {
         const before = (await client.rest.pulls.get(args)).data;
         if (optedOut(before, config.github.botAuthorAllowlist) || config.review.killSwitch || !sameSnapshot(before, initial)) {
           return { status: 'skipped_stale' };
@@ -149,7 +171,7 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
             config.review,
           );
         } catch {
-          return { status: 'budget_unavailable', coverage };
+          throw new Error('Budget store unavailable');
         }
         if (!reservation.reserved) {
           if (reservation.result) return reservation.result;
@@ -173,6 +195,7 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
       });
 
       if (result.status === 'skipped_stale') {
+        if (store?.markRunStale && liveIdentityKey) await store.markRunStale(liveIdentityKey);
         const latest = await step.run('read-latest-after-stale', async () => {
           if (config.review.killSwitch) return null;
           const pr = (await client.rest.pulls.get(args)).data;
@@ -193,7 +216,12 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
         }
         return logResult('skipped_stale');
       }
-      if (result.status !== 'complete') return logResult(result.status, { usage: result.usage ?? null });
+      if (result.status !== 'complete') {
+        if (result.status === 'already_published') {
+          if (store?.markRunDone && liveIdentityKey) await store.markRunDone(liveIdentityKey);
+        } else if (store?.markRunFailed && liveIdentityKey) await store.markRunFailed(liveIdentityKey);
+        return logResult(result.status, { usage: result.usage ?? null });
+      }
 
       const status = await step.run('publish', () => publish({
         client,
@@ -206,6 +234,13 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
         botId: initial.botId,
         config,
       }));
+      if (status === 'published') {
+        if (store?.markRunDone && liveIdentityKey) await store.markRunDone(liveIdentityKey);
+      } else if (status === 'skipped_stale') {
+        if (store?.markRunStale && liveIdentityKey) await store.markRunStale(liveIdentityKey);
+      } else if (status === 'failed') {
+        if (store?.markRunFailed && liveIdentityKey) await store.markRunFailed(liveIdentityKey);
+      }
       if (status === 'skipped_stale' && !config.review.killSwitch) {
         const latest = await step.run('read-latest-before-refresh', async () => {
           const pr = (await client.rest.pulls.get(args)).data;
@@ -234,6 +269,9 @@ export function createReviewFunction(inngest, config, store, dependencies = {}) 
         },
       });
     } catch (error) {
+      if (store?.markRunFailed && liveIdentityKey) {
+        await store.markRunFailed(liveIdentityKey).catch(() => {});
+      }
       if (error instanceof UnsupportedTokenizerError) {
         console.error(JSON.stringify({ category: 'review_configuration_error', runId, field: 'OPENAI_MODEL_TOKENIZER' }));
         throw new NonRetriableError('Configured OpenAI model has no supported tokenizer');

@@ -6,10 +6,11 @@ import { createApp } from '../app.js';
 import { createWebhookHandler, REVIEW_EVENT, CANCEL_REVIEW_EVENT, optedOut, pullRequestKey } from '../github/webhook.js';
 import { anchors, changedLines, collectContext, parsePatch } from '../review/context.js';
 import { estimateReviewInputTokens, reviewAI } from '../review/ai.js';
-import { redact, sanitize, sameSnapshot, classify } from '../review/safety.js';
+import { redact, sanitize, sameSnapshot, classify, identity } from '../review/safety.js';
 import { render, publish, recoverPublication } from '../review/publish.js';
 import { Store } from '../review/store.js';
 import { loadConfig } from '../config.js';
+import { buildReviewIdentityKey, ANALYSIS_VERSION } from '../review/identity.js';
 import { createReviewFunction } from '../inngest/function/review-pr.js';
 import { createPublicationRecoveryFunction } from '../inngest/function/recover-publications.js';
 
@@ -52,43 +53,42 @@ function signedPost(app, body, { signed = true, event = 'pull_request', delivery
   return req.send(raw);
 }
 
-function webhookApp({ send = async () => {}, fetchPullRequest = async () => livePR(), botAuthorAllowlist = [] } = {}) {
+function webhookApp({ send = async () => {}, botAuthorAllowlist = [] } = {}) {
   return createApp({
     githubWebhookHandler: createWebhookHandler({
       secret: webhookSecret,
       repositories: ['owner/repo'],
       botAuthorAllowlist,
       send,
-      fetchPullRequest,
     }),
   });
 }
 
-test('health route reports liveness; invalid webhook signature is rejected before lookup', async () => {
-  let lookups = 0;
-  const app = webhookApp({ fetchPullRequest: async () => { lookups++; return livePR(); } });
+test('health route reports liveness; invalid webhook signature is rejected before parsing', async () => {
+  const app = webhookApp();
   assert.deepEqual((await request(app).get('/health')).body, { status: 'ok', service: 'github-pr-review' });
   assert.equal((await signedPost(app, basePayload, { signed: false })).status, 401);
-  assert.equal(lookups, 0);
 });
 
-test('eligible webhook uses live snapshot and delivery identity', async () => {
+test('eligible webhook uses payload snapshot and shared identity key', async () => {
   const events = [];
   const app = webhookApp({
     send: async (event) => events.push(event),
-    fetchPullRequest: async () => livePR(),
   });
   const response = await signedPost(app, basePayload);
   assert.equal(response.status, 202);
   assert.equal(events.length, 1);
+  const expectedKey = buildReviewIdentityKey({ installationId: 1, repositoryId: 2, prNumber: 3, headSha: 'event-sha', baseSha: 'base-sha' });
   assert.equal(events[0].id, 'delivery-1');
   assert.equal(events[0].name, REVIEW_EVENT);
-  assert.equal(events[0].data.observedHeadSha, 'live-sha');
+  assert.equal(events[0].data.identityKey, expectedKey);
+  assert.equal(events[0].data.deliveryId, 'delivery-1');
+  assert.equal(events[0].data.observedHeadSha, 'event-sha');
   assert.equal(events[0].data.observedBaseSha, 'base-sha');
   assert.equal(events[0].data.prKey, '1:2:3');
 });
 
-test('title and skip-label transitions are checked against current GitHub state', async () => {
+test('title and skip-label transitions are checked against payload state', async () => {
   const events = [];
   const app = webhookApp({ send: async (event) => events.push(event) });
   const titleEdit = { ...basePayload, action: 'edited', changes: { title: { from: 'old' } } };
@@ -96,11 +96,7 @@ test('title and skip-label transitions are checked against current GitHub state'
   assert.equal(events[0].name, REVIEW_EVENT);
 
   const labeled = { ...basePayload, action: 'labeled', label: { name: 'skip-ai-review' } };
-  const cancelApp = webhookApp({
-    send: async (event) => events.push(event),
-    fetchPullRequest: async () => livePR({ labels: [{ name: 'skip-ai-review' }] }),
-  });
-  assert.equal((await signedPost(cancelApp, labeled, { delivery: 'delivery-2' })).status, 202);
+  assert.equal((await signedPost(app, labeled, { delivery: 'delivery-2' })).status, 202);
   assert.equal(events[1].name, CANCEL_REVIEW_EVENT);
   assert.equal(events[1].id, 'delivery-2:cancel');
 
@@ -116,8 +112,8 @@ test('draft, closed and disallowed bot PRs cancel matching pending review work',
     livePR({ user: { type: 'Bot', login: 'other-bot[bot]' } }),
   ]) {
     const events = [];
-    const app = webhookApp({ send: async (event) => events.push(event), fetchPullRequest: async () => current });
-    const response = await signedPost(app, basePayload);
+    const app = webhookApp({ send: async (event) => events.push(event) });
+    const response = await signedPost(app, { ...basePayload, pull_request: current });
     assert.equal(response.status, 202);
     assert.equal(events[0].name, CANCEL_REVIEW_EVENT);
   }
@@ -129,8 +125,7 @@ test('configured bot author exception is honored, but unrelated bot is skipped',
 });
 
 test('unsupported webhook actions and repositories are ignored without a GitHub lookup', async () => {
-  let lookups = 0;
-  const app = webhookApp({ fetchPullRequest: async () => { lookups++; return livePR(); } });
+  const app = webhookApp();
   assert.equal((await signedPost(app, { ...basePayload, action: 'synchronize' }, { event: 'issues' })).status, 202);
   assert.equal((await signedPost(app, { ...basePayload, action: 'edited', changes: { body: {} } })).status, 202);
   const otherRepo = {
@@ -138,20 +133,10 @@ test('unsupported webhook actions and repositories are ignored without a GitHub 
     repository: { ...basePayload.repository, full_name: 'elsewhere/repo', owner: { login: 'elsewhere' } },
   };
   assert.equal((await signedPost(app, otherRepo)).status, 202);
-  assert.equal(lookups, 0);
 });
 
-test('GitHub lookup and queue failures return retryable non-success responses', async () => {
-  const lookupFailure = webhookApp({ fetchPullRequest: async () => { throw new Error('private response'); } });
-  assert.equal((await signedPost(lookupFailure, basePayload)).status, 503);
-  const notFoundEvents = [];
-  const notFound = webhookApp({
-    send: async (event) => notFoundEvents.push(event),
-    fetchPullRequest: async () => { throw { status: 404 }; },
-  });
-  assert.equal((await signedPost(notFound, basePayload)).status, 202);
-  assert.equal(notFoundEvents.length, 0);
-  const enqueueFailure = webhookApp({ send: async () => { throw new Error('private response'); } });
+test('queue failures return retryable non-success responses', async () => {
+  const enqueueFailure = webhookApp({ send: async () => { throw new Error('queue unavailable'); } });
   assert.equal((await signedPost(enqueueFailure, basePayload)).status, 503);
   assert.equal((await signedPost(createApp(), basePayload)).status, 503);
 });
@@ -377,6 +362,8 @@ test('AI request is strict, token-bounded, redacted and findings require exact c
   assert.equal(requestBody.store, false);
   assert.equal(requestBody.text.format.strict, true);
   assert.equal(requestBody.max_output_tokens, 1000);
+  assert.match(requestBody.instructions, /at most 20\s+supported candidates/);
+  assert.match(requestBody.instructions, /fileChanges: At most 1 entries/);
   assert.doesNotMatch(requestBody.input, /ghp_12345678901234567890/);
   assert.equal(result.usage, 42);
   assert.equal(result.fileChanges.length, 1);
@@ -386,6 +373,62 @@ test('AI request is strict, token-bounded, redacted and findings require exact c
   const unsupported = completedAIOutput({ findings: [{ ...completedAIOutput().findings[0], evidence: 'This text is not in the diff.' }] });
   const rejected = await reviewAI({ responses: { create: async () => ({ status: 'completed', output_text: JSON.stringify(unsupported) }) } }, aiConfig, aiContext);
   assert.equal(rejected.findings.length, 0);
+});
+
+test('AI validates the transmitted redacted evidence and logs only borderline confidence and severity', async (t) => {
+  const info = t.mock.method(console, 'info', () => {});
+  const context = structuredClone(aiContext);
+  const original = 'const token = "synthetic-credential-value"';
+  const followingLine = 'const allowed = calculateLimit();';
+  context.files[0].patch = `@@ -0,0 +1,2 @@\n+${original}\n+${followingLine}`;
+  const baseFinding = completedAIOutput().findings[0];
+  const result = await reviewAI({ responses: { create: async (requestBody) => {
+    const patch = JSON.parse(requestBody.input).files[0].patch;
+    assert.doesNotMatch(patch, /synthetic-credential-value/);
+    assert.ok(patch.endsWith(`\n+${followingLine}`));
+    const markerEvidence = patch.split('\n')[1].slice(1);
+    assert.match(markerEvidence, /\[REDACTED\]/);
+    return { status: 'completed', output_text: JSON.stringify(completedAIOutput({
+      fileChanges: [{ ...completedAIOutput().fileChanges[0], evidence: original }],
+      findings: [
+        { ...baseFinding, evidence: markerEvidence, confidence: 0.80, title: 'Marker evidence' },
+        { ...baseFinding, evidence: original, confidence: 0.95, title: 'Original secret quote' },
+        { ...baseFinding, evidence: followingLine, line: 2, confidence: 0.70, severity: 'medium' },
+        { ...baseFinding, evidence: followingLine, line: 2, confidence: 0.79, severity: 'low' },
+        { ...baseFinding, evidence: followingLine, line: 2, confidence: 0.69 },
+        { ...baseFinding, evidence: 'Unmatched evidence', confidence: 0.75 },
+      ],
+    })) };
+  } } }, aiConfig, context);
+
+  assert.deepEqual(result.fileChanges, []);
+  assert.deepEqual(result.findings.map(({ title, anchorValid }) => ({ title, anchorValid })),
+    [{ title: 'Marker evidence', anchorValid: true }]);
+  assert.equal(info.mock.calls.length, 1);
+  assert.deepEqual(JSON.parse(info.mock.calls[0].arguments[0]), {
+    category: 'review_borderline_candidates',
+    candidates: [{ confidence: 0.70, severity: 'medium' }, { confidence: 0.79, severity: 'low' }],
+  });
+});
+
+test('a valid finding stays in the summary when multiline redaction shifts diff lines', async () => {
+  const context = structuredClone(aiContext);
+  const evidence = 'const count = computeCount();';
+  context.files[0].patch = [
+    '@@ -0,0 +1,4 @@',
+    '+-----BEGIN SYNTHETIC PRIVATE KEY-----',
+    '+mock-placeholder',
+    '+-----END SYNTHETIC PRIVATE KEY-----',
+    `+${evidence}`,
+  ].join('\n');
+  const result = await reviewAI({ responses: { create: async () => ({
+    status: 'completed',
+    output_text: JSON.stringify(completedAIOutput({
+      findings: [{ ...completedAIOutput().findings[0], line: 2, evidence }],
+    })),
+  }) } }, aiConfig, context);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].anchorValid, false);
 });
 
 test('AI refusal, incomplete output and unsupported tokenizer do not produce clean reviews', async () => {
@@ -659,6 +702,7 @@ test('review Inngest contract keeps debounce, retries, keyed concurrency and can
   const fakeInngest = { createFunction: (options, handler) => { functionOptions = options; return { handler }; } };
   createReviewFunction(fakeInngest, config, {});
   assert.equal(functionOptions.retries, 3);
+  assert.equal(functionOptions.idempotency, 'event.id');
   assert.deepEqual(functionOptions.debounce, { period: '20s', timeout: '2m', key: 'event.data.prKey' });
   assert.equal(functionOptions.concurrency[1].key, 'event.data.prKey');
   assert.equal(functionOptions.cancelOn[0].event, CANCEL_REVIEW_EVENT);
@@ -694,6 +738,10 @@ test('review step persists only sanitized findings and bounded coverage, never r
   };
   let reconciledResult;
   const store = {
+    claimRun: async () => ({ claimed: true }),
+    markRunDone: async () => {},
+    markRunStale: async () => {},
+    markRunFailed: async () => {},
     reserve: async () => ({ reserved: true }),
     reconcile: async (_id, _usage, result) => { reconciledResult = result; },
     markReservationUnknown: async () => {},
@@ -762,4 +810,246 @@ test('failed delivery uses the same delivery ID when GitHub redelivers', async (
   await signedPost(app, basePayload, { delivery: 'stable-guid' });
   assert.equal(events[0].id, events[1].id);
   assert.equal(pullRequestKey(events[0].data), '1:2:3');
+});
+
+test('same revision under different delivery ID produces identical event identityKey', async () => {
+  const events = [];
+  const app = webhookApp({ send: async (event) => events.push(event) });
+  await signedPost(app, basePayload, { delivery: 'delivery-first' });
+  await signedPost(app, basePayload, { delivery: 'delivery-second' });
+  assert.equal(events.length, 2);
+  assert.notEqual(events[0].id, events[1].id);
+  assert.equal(events[0].data.identityKey, events[1].data.identityKey);
+  assert.equal(events[0].data.deliveryId, 'delivery-first');
+  assert.equal(events[1].data.deliveryId, 'delivery-second');
+});
+
+test('new push with different head SHA generates distinct identityKey', async () => {
+  const events = [];
+  const app = webhookApp({ send: async (event) => events.push(event) });
+  await signedPost(app, basePayload);
+  const updatedPayload = {
+    ...basePayload,
+    pull_request: { ...basePayload.pull_request, head: { sha: 'new-commit-sha' } },
+  };
+  await signedPost(app, updatedPayload, { delivery: 'delivery-next' });
+  assert.equal(events.length, 2);
+  assert.notEqual(events[0].id, events[1].id);
+  assert.equal(events[1].data.identityKey, buildReviewIdentityKey({ installationId: 1, repositoryId: 2, prNumber: 3, baseSha: 'base-sha', headSha: 'new-commit-sha' }));
+});
+
+test('webhook replies 202 without waiting on any GitHub network call', async () => {
+  const app = createApp({
+    githubWebhookHandler: createWebhookHandler({
+      secret: webhookSecret,
+      repositories: ['owner/repo'],
+      send: async () => {},
+    }),
+  });
+  const start = Date.now();
+  const response = await signedPost(app, basePayload);
+  const elapsed = Date.now() - start;
+  assert.equal(response.status, 202);
+  assert.ok(elapsed < 100);
+});
+
+test('two concurrent runs calling claimRun for same key serialize atomically and only one wins', async () => {
+  const store = Object.create(Store.prototype);
+  const rows = new Map();
+  let lockHeld = false;
+  store.transaction = async (fn) => {
+    while (lockHeld) await new Promise((r) => setImmediate(r));
+    lockHeld = true;
+    try {
+      const connection = {
+        query: async (sql, params) => {
+          if (sql.startsWith('SELECT state')) {
+            const row = rows.get(params[0]);
+            return { rows: row ? [row] : [] };
+          }
+          if (sql.startsWith('INSERT INTO review_run')) {
+            if (rows.has(params[0])) throw new Error('duplicate key value violates unique constraint');
+            rows.set(params[0], { state: params[1], updated_at: new Date() });
+            return { rows: [] };
+          }
+          if (sql.startsWith('UPDATE review_run')) {
+            rows.set(params[0], { state: 'started', updated_at: new Date() });
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+      };
+      return await fn(connection);
+    } finally {
+      lockHeld = false;
+    }
+  };
+
+  const [res1, res2] = await Promise.all([
+    store.claimRun('test:key:1'),
+    store.claimRun('test:key:1'),
+  ]);
+
+  const claimedCount = [res1, res2].filter((r) => r.claimed).length;
+  assert.equal(claimedCount, 1);
+  const inProgressCount = [res1, res2].filter((r) => !r.claimed && r.reason === 'in_progress').length;
+  assert.equal(inProgressCount, 1);
+});
+
+test('database safety net: key marked done causes review to skip duplicate execution', async () => {
+  let reviewStepRan = false;
+  const store = {
+    claimRun: async () => ({ claimed: false, reason: 'done' }),
+    markRunDone: async () => {},
+  };
+  const config = {
+    ...aiConfig,
+    github: { repositoryAllowlist: ['owner/repo'], botAuthorAllowlist: [] },
+    review: { ...aiConfig.review, maxFiles: 30, maxInputChars: 80000, maxInputTokens: 24000, globalConcurrency: 5, dailyTokenLimit: 100000, globalDailyTokenLimit: 500000, prDailyTokenLimit: 50000, killSwitch: false },
+  };
+  const client = {
+    rest: {
+      pulls: { get: async () => ({ data: livePR() }) },
+      apps: { getAuthenticated: async () => ({ data: { id: 9, slug: 'review-bot' } }) },
+      users: { getByUsername: async () => ({ data: { id: 5 } }) },
+    },
+  };
+  const fakeInngest = { createFunction: (_opts, handler) => handler };
+  const handler = createReviewFunction(fakeInngest, config, store, {
+    installationClient: () => client,
+    aiClient: () => { reviewStepRan = true; return {}; },
+  });
+  const step = {
+    run: async (name, fn) => fn(),
+    sendEvent: async () => {},
+  };
+  const output = await handler({
+    event: { data: { ...publishData, observedAt: '2026-11-23T00:00:00Z' } },
+    step,
+    runId: 'run-done-test',
+  });
+  assert.equal(output.status, 'skipped_already_done');
+  assert.equal(reviewStepRan, false);
+});
+
+test('failed run allows retry via claimRun and stale run allows retry', async () => {
+  const store = Object.create(Store.prototype);
+  let state = 'failed';
+  store.transaction = async (fn) => fn({
+    query: async (sql, params) => {
+      if (sql.startsWith('SELECT state')) {
+        return { rows: [{ state, updated_at: new Date() }] };
+      }
+      if (sql.startsWith('UPDATE review_run')) {
+        state = 'started';
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const retryResult = await store.claimRun('failed-key');
+  assert.equal(retryResult.claimed, true);
+  assert.equal(retryResult.reason, 'retry_failed');
+
+  state = 'stale';
+  const staleResult = await store.claimRun('stale-key');
+  assert.equal(staleResult.claimed, true);
+  assert.equal(staleResult.reason, 'retry_stale');
+});
+
+test('abandoned run older than timeout allows retry via claimRun', async () => {
+  const store = Object.create(Store.prototype);
+  const oldDate = new Date(Date.now() - 20 * 60 * 1000); // 20 minutes ago
+  store.transaction = async (fn) => fn({
+    query: async (sql) => {
+      if (sql.startsWith('SELECT state')) {
+        return { rows: [{ state: 'started', updated_at: oldDate }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  const abandonedResult = await store.claimRun('abandoned-key', 15);
+  assert.equal(abandonedResult.claimed, true);
+  assert.equal(abandonedResult.reason, 'retry_abandoned');
+});
+
+test('out-of-order delivery uses live head SHA from GitHub and claims live identity key', async () => {
+  let claimedKey = null;
+  const store = {
+    claimRun: async (key) => { claimedKey = key; return { claimed: true }; },
+    reserve: async () => ({ reserved: true }),
+    reconcile: async () => {},
+    claimPublication: async () => true,
+    reserveWriteSlot: async () => new Date(),
+    mark: async () => {},
+    markRunDone: async () => {},
+  };
+  const config = {
+    ...aiConfig,
+    github: { repositoryAllowlist: ['owner/repo'], botAuthorAllowlist: [] },
+    review: { ...aiConfig.review, maxFiles: 30, maxInputChars: 80000, maxInputTokens: 24000, globalConcurrency: 5, dailyTokenLimit: 100000, globalDailyTokenLimit: 500000, prDailyTokenLimit: 50000, killSwitch: false },
+  };
+  const eventData = {
+    ...publishData,
+    observedHeadSha: 'old-event-sha',
+    observedBaseSha: 'base-sha',
+    observedAt: '2026-11-23T00:00:00Z',
+  };
+  const client = {
+    paginate: { iterator: async function* () { yield { data: [] }; } },
+    rest: {
+      pulls: {
+        get: async () => ({ data: livePR({ head: { sha: 'newer-live-sha' } }) }),
+        listFiles: async () => {},
+        listReviews: async () => {},
+        createReview: async () => ({ data: { id: 202 } }),
+      },
+      apps: { getAuthenticated: async () => ({ data: { id: 9, slug: 'review-bot' } }) },
+      users: { getByUsername: async () => ({ data: { id: 5 } }) },
+    },
+  };
+  const fakeInngest = { createFunction: (_opts, handler) => handler };
+  const handler = createReviewFunction(fakeInngest, config, store, {
+    installationClient: () => client,
+    aiClient: () => ({ responses: { create: async () => ({ status: 'completed', output_text: JSON.stringify(completedAIOutput()), usage: { total_tokens: 10 } }) } }),
+  });
+  const step = {
+    run: async (name, fn) => fn(),
+    sendEvent: async () => {},
+  };
+  const output = await handler({ event: { data: eventData }, step, runId: 'run-out-of-order' });
+  assert.equal(output.status, 'published');
+  assert.equal(claimedKey, buildReviewIdentityKey({ installationId: 1, repositoryId: 2, prNumber: 3, headSha: 'newer-live-sha', baseSha: 'base-sha', configKey: identity(eventData, { base: 'base-sha', head: 'newer-live-sha' }, config) }));
+});
+
+test('base retarget has a distinct snapshot identity while delivery redelivery remains stable', async () => {
+  const events = [];
+  const app = webhookApp({ send: async (event) => events.push(event) });
+  await signedPost(app, basePayload, { delivery: 'base-1' });
+  await signedPost(app, { ...basePayload, action: 'edited', changes: { base: {} }, pull_request: { ...basePayload.pull_request, base: { sha: 'another-base' } } }, { delivery: 'base-2' });
+  assert.notEqual(events[0].data.identityKey, events[1].data.identityKey);
+  assert.notEqual(events[0].id, events[1].id);
+});
+
+test('budget store failure is retried and does not mark review done', async () => {
+  let done = false, failed = false;
+  const fileList = async () => {};
+  const client = {
+    paginate: { iterator: async function* (endpoint) { yield { data: endpoint === fileList ? [{ filename: 'a.js', status: 'modified', patch: '@@ -1 +1 @@\n-const x = 0;\n+const x = 1;' }] : [] }; } },
+    rest: {
+      pulls: { get: async () => ({ data: livePR() }), listFiles: fileList, listReviews: async () => {} },
+      repos: { getContent: async () => ({ data: { type: 'file', encoding: 'base64', content: Buffer.from('const x = 1;').toString('base64'), size: 12 } }) },
+      apps: { getAuthenticated: async () => ({ data: { slug: 'review-bot' } }) },
+      users: { getByUsername: async () => ({ data: { id: 5 } }) },
+    },
+  };
+  const store = { claimRun: async () => ({ claimed: true }), reserve: async () => { throw new Error('db down'); }, markRunFailed: async () => { failed = true; }, markRunDone: async () => { done = true; } };
+  const config = { ...aiConfig, github: { repositoryAllowlist: ['owner/repo'], botAuthorAllowlist: [] }, review: { ...aiConfig.review, maxFiles: 30, maxInputChars: 80000, maxInputTokens: 24000, globalConcurrency: 5, killSwitch: false } };
+  const handler = createReviewFunction({ createFunction: (_options, callback) => callback }, config, store, { installationClient: () => client });
+  const data = { ...publishData, observedAt: '2026-11-23T00:00:00Z' };
+  await assert.rejects(handler({ event: { data }, step: { run: async (_name, fn) => fn() }, runId: 'budget-test' }), /transient provider error/);
+  assert.equal(done, false);
+  assert.equal(failed, true);
 });

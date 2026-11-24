@@ -30,10 +30,6 @@ if (config) {
     repositories: config.github.repositoryAllowlist,
     botAuthorAllowlist: config.github.botAuthorAllowlist,
     send: (event) => inngestClient.send(event),
-    fetchPullRequest: async (data) => {
-      const client = installationClient(config.github, data.installationId);
-      return (await client.rest.pulls.get({ owner: data.owner, repo: data.repo, pull_number: data.prNumber })).data;
-    },
   });
   const app = createApp({ githubWebhookHandler, inngestClient, reviewFunctions });
   const server = app.listen(config.port, () => {

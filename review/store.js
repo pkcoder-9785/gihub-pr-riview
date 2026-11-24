@@ -1,9 +1,12 @@
 import pg from 'pg';
+import { AnalysisStore, ANALYSIS_SCHEMA } from './analysis-store.js';
 
 const GLOBAL_BUDGET_LOCK = 74821390;
+export const RUN_ABANDONED_TIMEOUT_MINUTES = 15;
 
-export class Store {
+export class Store extends AnalysisStore {
   constructor(connectionString) {
+    super();
     this.pool = new pg.Pool({ connectionString, connectionTimeoutMillis: 5000 });
     this.ready = null;
   }
@@ -77,8 +80,34 @@ export class Store {
           installation_id text NOT NULL,
           scheduled_at timestamptz NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS review_run (
+          identity_key text PRIMARY KEY,
+          state text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS review_run_state_updated_idx
+          ON review_run(state, updated_at);
         CREATE INDEX IF NOT EXISTS review_publication_recovery_idx
           ON review_publication(status, updated_at);
+        CREATE TABLE IF NOT EXISTS file_facts (
+          repository_id bigint NOT NULL,
+          blob_sha text NOT NULL,
+          parser_version text NOT NULL,
+          facts jsonb NOT NULL,
+          parse_status text NOT NULL,
+          indexed_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY(repository_id, blob_sha, parser_version)
+        );
+        CREATE TABLE IF NOT EXISTS file_identifier_index (
+          repository_id bigint NOT NULL,
+          identifier text NOT NULL,
+          blob_sha text NOT NULL,
+          PRIMARY KEY(repository_id, identifier, blob_sha)
+        );
+        CREATE INDEX IF NOT EXISTS file_identifier_lookup_idx
+          ON file_identifier_index(repository_id, identifier);
+        ${ANALYSIS_SCHEMA}
       `).catch((error) => {
         this.ready = null;
         throw error;
@@ -317,6 +346,173 @@ export class Store {
       );
       return scheduledAt;
     });
+  }
+
+  async claimRun(identityKey, timeoutMinutes = RUN_ABANDONED_TIMEOUT_MINUTES) {
+    return this.transaction(async (connection) => {
+      const existing = (await connection.query(
+        'SELECT state, updated_at FROM review_run WHERE identity_key = $1 FOR UPDATE',
+        [identityKey],
+      )).rows[0];
+
+      if (!existing) {
+        await connection.query(
+          "INSERT INTO review_run(identity_key, state, created_at, updated_at) VALUES ($1, 'started', now(), now())",
+          [identityKey],
+        );
+        return { claimed: true };
+      }
+
+      if (existing.state === 'done') {
+        return { claimed: false, reason: 'done' };
+      }
+
+      if (existing.state === 'failed') {
+        await connection.query(
+          "UPDATE review_run SET state = 'started', updated_at = now() WHERE identity_key = $1",
+          [identityKey],
+        );
+        return { claimed: true, reason: 'retry_failed' };
+      }
+
+      if (existing.state === 'stale') {
+        await connection.query(
+          "UPDATE review_run SET state = 'started', updated_at = now() WHERE identity_key = $1",
+          [identityKey],
+        );
+        return { claimed: true, reason: 'retry_stale' };
+      }
+
+      const ageMs = Date.now() - new Date(existing.updated_at).getTime();
+      if (ageMs >= timeoutMinutes * 60 * 1000) {
+        await connection.query(
+          "UPDATE review_run SET state = 'started', updated_at = now() WHERE identity_key = $1",
+          [identityKey],
+        );
+        return { claimed: true, reason: 'retry_abandoned' };
+      }
+
+      return { claimed: false, reason: 'in_progress' };
+    });
+  }
+
+  async markRunState(identityKey, state) {
+    await this.init();
+    await this.pool.query(
+      `INSERT INTO review_run(identity_key, state, created_at, updated_at)
+       VALUES ($1, $2, now(), now())
+       ON CONFLICT (identity_key) DO UPDATE SET state = $2, updated_at = now()`,
+      [identityKey, state],
+    );
+  }
+
+  async markRunDone(identityKey) {
+    return this.markRunState(identityKey, 'done');
+  }
+
+  async markRunStale(identityKey) {
+    return this.markRunState(identityKey, 'stale');
+  }
+
+  async markRunFailed(identityKey) {
+    return this.markRunState(identityKey, 'failed');
+  }
+
+  async upsertFileFacts({ repositoryId, blobSha, parserVersion, facts, parseStatus, identifiers = [] }) {
+    await this.init();
+    await this.pool.query(
+      `INSERT INTO file_facts (repository_id, blob_sha, parser_version, facts, parse_status, indexed_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (repository_id, blob_sha, parser_version)
+       DO UPDATE SET facts = EXCLUDED.facts, parse_status = EXCLUDED.parse_status, indexed_at = now()`,
+      [repositoryId, blobSha, parserVersion, JSON.stringify(facts), parseStatus],
+    );
+
+    if (Array.isArray(identifiers) && identifiers.length > 0) {
+      const uniqueIds = Array.from(new Set(identifiers.filter((id) => typeof id === 'string' && id.length > 0)));
+      if (uniqueIds.length > 0) {
+        const values = [];
+        const params = [repositoryId, blobSha];
+        let paramIdx = 3;
+        for (const id of uniqueIds) {
+          values.push(`($1, $${paramIdx++}, $2)`);
+          params.push(id);
+        }
+        await this.pool.query(
+          `INSERT INTO file_identifier_index (repository_id, identifier, blob_sha)
+           VALUES ${values.join(', ')}
+           ON CONFLICT DO NOTHING`,
+          params,
+        );
+      }
+    }
+  }
+
+  async getFileFacts(repositoryId, blobSha, parserVersion) {
+    await this.init();
+    const { rows } = await this.pool.query(
+      `SELECT facts, parse_status, indexed_at
+       FROM file_facts
+       WHERE repository_id = $1 AND blob_sha = $2 AND parser_version = $3`,
+      [repositoryId, blobSha, parserVersion],
+    );
+    if (!rows.length) return null;
+    return {
+      facts: rows[0].facts,
+      parseStatus: rows[0].parse_status,
+      indexedAt: rows[0].indexed_at,
+    };
+  }
+
+  async batchGetFileFacts(repositoryId, blobShas, parserVersion) {
+    await this.init();
+    if (!Array.isArray(blobShas) || blobShas.length === 0) return new Map();
+    const uniqueShas = Array.from(new Set(blobShas));
+    const { rows } = await this.pool.query(
+      `SELECT blob_sha, facts, parse_status, indexed_at
+       FROM file_facts
+       WHERE repository_id = $1 AND parser_version = $3 AND blob_sha = ANY($2::text[])`,
+      [repositoryId, uniqueShas, parserVersion],
+    );
+    const map = new Map();
+    for (const row of rows) {
+      map.set(row.blob_sha, {
+        facts: row.facts,
+        parseStatus: row.parse_status,
+        indexedAt: row.indexed_at,
+      });
+    }
+    return map;
+  }
+
+  async findBlobShasWithIdentifiers(repositoryId, identifiers) {
+    await this.init();
+    if (!Array.isArray(identifiers) || identifiers.length === 0) return new Map();
+    const uniqueIds = Array.from(new Set(identifiers));
+    const { rows } = await this.pool.query(
+      `SELECT identifier, blob_sha
+       FROM file_identifier_index
+       WHERE repository_id = $1 AND identifier = ANY($2::text[])`,
+      [repositoryId, uniqueIds],
+    );
+    const result = new Map();
+    for (const row of rows) {
+      if (!result.has(row.identifier)) {
+        result.set(row.identifier, new Set());
+      }
+      result.get(row.identifier).add(row.blob_sha);
+    }
+    return result;
+  }
+
+  async pruneOldFacts(daysOld = 30) {
+    await this.init();
+    const { rowCount } = await this.pool.query(
+      `DELETE FROM file_facts
+       WHERE indexed_at < now() - ($1 || ' days')::interval`,
+      [String(Math.max(1, Number(daysOld) || 30))],
+    );
+    return rowCount;
   }
 
   async close() {

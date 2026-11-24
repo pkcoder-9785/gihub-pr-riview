@@ -46,6 +46,22 @@ const envSchema = z
 
     OPENAI_API_KEY: z.string().trim().min(1),
     OPENAI_MODEL: z.string().trim().min(1),
+    REVIEW_V3_ENABLED: z.enum(['true', 'false']).default('false'),
+    REVIEW_V3_AGENT_MODELS: z.string().default('{}').transform((value, ctx) => {
+      try { return z.object({ 'context-dependency': z.string().min(1).optional(), 'security-logic': z.string().min(1).optional(), architecture: z.string().min(1).optional() }).strict().parse(JSON.parse(value)); }
+      catch { ctx.addIssue({ code: 'custom', message: 'Expected agent-to-model mapping' }); return z.NEVER; }
+    }),
+    REVIEW_V3_MODEL_PRICING: z.string().default('{}').transform((value, ctx) => {
+      try {
+        return z.record(z.string(), z.object({ input: z.number().nonnegative(), output: z.number().nonnegative() }).strict()).parse(JSON.parse(value));
+      } catch { ctx.addIssue({ code: 'custom', message: 'Expected model input/output USD per million tokens' }); return z.NEVER; }
+    }),
+    REVIEW_V3_AGENT_INPUT_TOKENS: positiveInteger(8000).pipe(z.number().max(24000)),
+    REVIEW_V3_AGENT_OUTPUT_TOKENS: positiveInteger(1500).pipe(z.number().max(4000)),
+    REVIEW_V3_AGENT_COST_MICROS: positiveInteger(100000),
+    REVIEW_V3_PR_COST_MICROS: positiveInteger(300000),
+    REVIEW_V3_MONTHLY_COST_MICROS: positiveInteger(30000000),
+    REVIEW_V3_TIMEOUT_MS: positiveInteger(90000).pipe(z.number().max(180000)),
 
     INNGEST_EVENT_KEY: z.string().trim().optional(),
     INNGEST_SIGNING_KEY: z.string().trim().optional(),
@@ -139,6 +155,17 @@ export function loadConfig(environment = process.env) {
       globalDailyTokenLimit: env.REVIEW_GLOBAL_DAILY_TOKEN_LIMIT,
       prDailyTokenLimit: env.REVIEW_PR_DAILY_TOKEN_LIMIT,
       killSwitch: env.REVIEW_KILL_SWITCH,
+      v3: {
+        enabled: env.REVIEW_V3_ENABLED === 'true',
+        models: env.REVIEW_V3_AGENT_MODELS,
+        pricing: env.REVIEW_V3_MODEL_PRICING,
+        agentInputTokens: env.REVIEW_V3_AGENT_INPUT_TOKENS,
+        agentOutputTokens: env.REVIEW_V3_AGENT_OUTPUT_TOKENS,
+        agentCostMicros: env.REVIEW_V3_AGENT_COST_MICROS,
+        prCostMicros: env.REVIEW_V3_PR_COST_MICROS,
+        monthlyCostMicros: env.REVIEW_V3_MONTHLY_COST_MICROS,
+        timeoutMs: env.REVIEW_V3_TIMEOUT_MS,
+      },
     },
   };
 }
