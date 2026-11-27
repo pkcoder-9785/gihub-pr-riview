@@ -46,6 +46,7 @@ const envSchema = z
 
     OPENAI_API_KEY: z.string().trim().min(1),
     OPENAI_MODEL: z.string().trim().min(1),
+    REVIEW_V3_ASTRA_SONNET: z.enum(['true', 'false']).default('false'),
     REVIEW_V3_ENABLED: z.enum(['true', 'false']).default('false'),
     REVIEW_V3_AGENT_MODELS: z.string().default('{}').transform((value, ctx) => {
       try { return z.object({ 'context-dependency': z.string().min(1).optional(), 'security-logic': z.string().min(1).optional(), architecture: z.string().min(1).optional() }).strict().parse(JSON.parse(value)); }
@@ -157,8 +158,13 @@ export function loadConfig(environment = process.env) {
       killSwitch: env.REVIEW_KILL_SWITCH,
       v3: {
         enabled: env.REVIEW_V3_ENABLED === 'true',
-        models: env.REVIEW_V3_AGENT_MODELS,
-        pricing: env.REVIEW_V3_MODEL_PRICING,
+        astraSonnet: env.REVIEW_V3_ASTRA_SONNET === 'true',
+        models: env.REVIEW_V3_ASTRA_SONNET === 'true'
+          ? { 'security-logic': 'gpt-6.1-sol', architecture: 'gpt-6.2-astra' }
+          : env.REVIEW_V3_AGENT_MODELS,
+        pricing: env.REVIEW_V3_ASTRA_SONNET === 'true'
+          ? { 'gpt-6.1-sol': { input: 2, output: 10 }, 'gpt-6.2-astra': { input: 8, output: 40 }, ...env.REVIEW_V3_MODEL_PRICING }
+          : env.REVIEW_V3_MODEL_PRICING,
         agentInputTokens: env.REVIEW_V3_AGENT_INPUT_TOKENS,
         agentOutputTokens: env.REVIEW_V3_AGENT_OUTPUT_TOKENS,
         agentCostMicros: env.REVIEW_V3_AGENT_COST_MICROS,

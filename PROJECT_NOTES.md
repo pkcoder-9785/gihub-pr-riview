@@ -38,122 +38,56 @@ Bot sirf review karega. Ye code execute/edit, PR approve, block ya merge nahi ka
 
 `package.json` mein `test` script `node --test` hai. Dependency declarations actual manifest se check karo; purane notes ka dependency status stale ho sakta hai.
 
-## System design diagrams
+## System design diagram
 
-Diagrams current source tree ko dikhate hain. Default review path single structured AI review hai. Three-agent static-analysis path sirf REVIEW_V3_ENABLED=true par chalta hai. In diagrams ka matlab live Railway, PostgreSQL, GitHub App, OpenAI ya Inngest integration ka current health verified hona nahi hai.
+Yeh portrait chart current source workflow ko dikhata hai. Default review path single structured AI review hai. Three-agent static-analysis path sirf REVIEW_V3_ENABLED=true par chalta hai. Chart live Railway, PostgreSQL, GitHub App, OpenAI ya Inngest integration ka current health verified hona nahi dikhata.
 
-### Component aur trust-boundary diagram
+### Portrait workflow diagram
 
-```mermaid
-flowchart LR
-  subgraph EXT["External services"]
-    GH["GitHub App<br/>Webhooks and PR APIs"]
-    IQ["Inngest durable event engine"]
-    LLM["OpenAI Responses API<br/>store=false"]
-    PG[("PostgreSQL")]
-  end
-
-  subgraph APP["Node.js service: index.js + Express"]
-    WH["POST /api/github/webhooks<br/>raw bytes, HMAC-SHA256, event filter, allowlist"]
-    IR["POST /api/inngest<br/>Inngest function serve endpoint"]
-    REVIEW["review-pr coordinator<br/>live snapshot, idempotency, freshness"]
-    CTX["Bounded diff/context collector<br/>redaction and token budget"]
-    SINGLE["Default review path<br/>one structured AI request"]
-    V3["Optional V3 analysis<br/>AST, resolver, impact graph"]
-    AGENTS["V3 agents<br/>context/dependency + security/logic"]
-    ARCH["V3 architecture agent<br/>prior finding assessment"]
-    CHECK["Output validation<br/>schema, evidence, anchor, confidence"]
-    PUB["Snapshot-safe GitHub publisher<br/>marker reconciliation"]
-    REC["Scheduled publication recovery"]
-  end
-
-  GH -->|pull_request delivery| WH
-  WH -->|verified event or cancellation| IQ
-  IQ -->|invoke registered functions| IR
-  IR --> REVIEW
-  REVIEW -->|installation-authenticated reads| GH
-  REVIEW --> CTX
-  CTX --> SINGLE
-  CTX -->|only when enabled| V3
-  V3 --> AGENTS
-  AGENTS --> ARCH
-  SINGLE -->|structured request| LLM
-  ARCH -->|structured request| LLM
-  LLM --> CHECK
-  CHECK --> PUB
-  PUB -->|comment review on exact head commit| GH
-  REVIEW -->|run claim, token budget, result| PG
-  PUB -->|publication and write schedule| PG
-  V3 -->|index, artifacts, finding state, metrics, budgets| PG
-  IQ -->|one-minute cron trigger| IR
-  IR --> REC
-  REC -->|claim/reconcile unresolved writes| PG
-  REC -->|marker lookup and safe recovery write| GH
-```
-
-### End-to-end review sequence
+Delivery se final PR comment tak ka main path, default AI mode, optional V3 lane, durable state aur recovery ek vertical chart mein:
 
 ```mermaid
-sequenceDiagram
-  autonumber
-  participant GH as GitHub
-  participant API as Express service
-  participant Q as Inngest
-  participant W as Review workflow
-  participant DB as PostgreSQL
-  participant AI as OpenAI
+flowchart TB
+  GH["GitHub App<br/>PR webhook + review APIs"]
+  WH["Express intake<br/>raw-body HMAC + event/allowlist checks<br/>bad signature 401 · enqueue failure 503"]
+  Q["Inngest event queue<br/>delivery-ID dedupe · per-PR debounce · retries"]
+  WORK["Review worker<br/>live PR eligibility + snapshot identity"]
+  CTX["Bounded context<br/>diff/source fetch · redaction · token limits"]
+  MODE{"V3 enabled?"}
+  SINGLE["Default path<br/>one structured AI review"]
+  V3["Optional V3 path<br/>AST/index · dependency impact · three agents"]
+  AI["OpenAI Responses API<br/>store=false"]
+  CHECK["Validate output<br/>schema + changed-line evidence · max five findings"]
+  FRESH{"PR eligible and<br/>base/head unchanged?"}
+  STALE["Suppress stale result<br/>queue latest eligible snapshot"]
+  PUB["Safe publication<br/>marker reconciliation · write pacing"]
+  COMMENT["Post advisory COMMENT<br/>on the reviewed head commit"]
+  DB[("PostgreSQL<br/>run claims · budgets · analysis · publication state")]
+  REC["Inngest recovery<br/>every-minute marker reconciliation"]
 
-  GH->>API: pull_request webhook with raw body
-  API->>API: Verify HMAC, event, metadata and repository allowlist
-  alt invalid signature
-    API-->>GH: 401
-  else valid delivery
-    API->>Q: Send event using GitHub delivery ID
-    alt queue send fails
-      API-->>GH: 503 so delivery is not acknowledged
-    else event accepted
-      API-->>GH: 202
-      Q->>API: Invoke review-pr through /api/inngest
-      API->>W: Start durable run
-      W->>GH: Fetch current PR and installation identity
-      W->>DB: Claim repository/PR/base/head/config identity
-      W->>GH: Fetch paginated diff and bounded source context
-      W->>W: Redact secrets, trim to file/character/token limits
-      W->>DB: Reserve configured token budget before the model call
-      alt REVIEW_V3_ENABLED=true
-        W->>GH: Read base/head trees and source blobs
-        W->>DB: Persist versioned symbols, edges and compact artifacts
-        W->>W: Resolve dependencies and calculate change impact
-        par Context/dependency agent
-          W->>AI: Structured specialist request
-        and Security/logic agent
-          W->>AI: Structured specialist request
-        end
-        W->>AI: Architecture agent assesses prior findings
-      else V3 disabled
-        W->>AI: One structured review request with store=false
-      end
-      AI-->>W: Structured model result and usage
-      W->>W: Validate claims against changed-line evidence
-      W->>DB: Settle known usage or retain an unknown reservation
-      W->>GH: Re-fetch PR base/head before publication
-      alt snapshot stale or PR opted out
-        W->>DB: Mark stale; do not publish
-      else current snapshot
-        W->>DB: Persist publication intent and installation write slot
-        W->>GH: Search bot review marker, then post COMMENT on head SHA
-        alt write result ambiguous
-          W->>GH: Reconcile marker before any retry
-          Q->>API: Scheduled recovery invokes recovery function
-          API->>DB: Load due publication and claim recovery
-          API->>GH: Recheck marker and snapshot before retry
-        else write confirmed
-          GH-->>W: Review ID
-          W->>DB: Mark publication and run complete
-        end
-      end
-    end
-  end
+  GH -->|pull_request event| WH
+  WH -->|verified and allowlisted| Q
+  Q -->|durable invocation| WORK
+  WORK --> CTX
+  CTX --> MODE
+  MODE -->|No · default| SINGLE
+  MODE -->|Yes| V3
+  SINGLE --> AI
+  V3 --> AI
+  AI --> CHECK
+  CHECK --> FRESH
+  FRESH -->|No| STALE
+  STALE -->|refresh event| Q
+  FRESH -->|Yes| PUB
+  PUB --> COMMENT
+  COMMENT --> GH
+  WORK -. run claim .-> DB
+  CTX -. token budget .-> DB
+  V3 -. index and findings .-> DB
+  PUB -. publication intent and result .-> DB
+  Q -. cron .-> REC
+  REC -. recovery claim .-> DB
+  REC -->|retry only after marker check| GH
 ```
 
 ### Component responsibility map
@@ -379,7 +313,7 @@ Application-code implementation steps 1–6 complete hain. Next work is deployme
 
 | Date | Change | Verification |
 | --- | --- | --- |
-| 2026-11-24 | Current implementation se matched system architecture, component/trust-boundary diagram, end-to-end sequence, PostgreSQL data groups, failure and correctness contracts add kiye; V3 optional/default-off distinction document ki | Current source aur project notes read-only inspect hue; Mermaid diagrams aur file references read-back kiye; git diff --check pass. Tests aur live integrations is documentation-only change mein run nahi hue. |
+| 2026-11-24 | Current implementation se matched single portrait workflow diagram, PostgreSQL data groups, failure and correctness contracts add kiye; V3 optional/default-off distinction document ki | Current source aur project notes read-only inspect hue; Mermaid diagrams aur file references read-back kiye; git diff --check pass. Tests aur live integrations is documentation-only change mein run nahi hue. |
 | 2026-11-21 | Config, Express app, server startup/shutdown aur Inngest scaffold work | Historical checks neeche prior notes mein the; is update mein dobara execute nahi hue. |
 | 2026-11-22 | Persistent Codex team config/workflow documented | Historical evidence `.codex/validation.md` mein hai; is update mein dobara verify nahi hua. |
 | 2026-11-22 | Corrected Plan (v4) ko current design aur source tree se reconcile kiya; stale implementation claims replace kiye | PDF ke 6 pages text/render se inspect hue; current source aur `package.json` read-only inspect hue; backend read-only gap audit mila. Koi code/test command run nahi hua. |
@@ -507,3 +441,13 @@ Focused tests 34/34 pass. Full `npm test` 147/147 pass, 0 skipped, including 6 P
 ## Resume prompt
 
 > PROJECT_NOTES.md aur AGENTS.md padho, actual source se status verify karo, aur Corrected Plan v4 ke current next step se incremental kaam karo. Is notes file ko har completed change ke baad update karo. Secrets ya raw repository source ko notes/log mein kabhi mat likho.
+
+## Astra aur Sol review mode
+
+`REVIEW_V3_ENABLED=true` aur `REVIEW_V3_ASTRA_SONNET=true` set karne par ek GPT-6.1 Sol low effort par security, logic aur dependency findings banata hai. GPT-6.2 Astra medium un findings ko diff evidence ke against recheck karta hai. Sirf Astra se confirm hui findings existing verifier aur publisher ko jaati hain. Findings mein fix suggestion nahi hota. Is mode ke liye runtime mein existing `OPENAI_API_KEY` chahiye.
+
+Is mode mein provider token counts budget reservation se pehle use hote hain. Astra ka default $0.10 per-agent cap, 1,500 output tokens reserve karne par, input ko 5,000 tokens tak bound karta hai. Bada evidence packet trim ho sakta hai aur partial coverage report hoti hai. Live provider calls aur automated tests is change mein run nahi hue.
+
+First reviewer ko Sonnet se Sol par switch kiya. Anthropic adapter future reuse ke liye retained hai. Existing feature flag ka naam compatibility ke liye same hai.
+
+Deployment precheck: 141 local tests passed, zero failed, one database integration check skipped. GitHub production smoke check pending.

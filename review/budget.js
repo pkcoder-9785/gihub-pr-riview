@@ -2,12 +2,13 @@ import { countRequestTokens } from './tokenizer.js';
 
 export const AGENT_ROLES = Object.freeze(['context-dependency', 'security-logic', 'architecture']);
 const unlimited = Number.MAX_SAFE_INTEGER;
-export function agentReservation({ config, data, role, model, request, now = new Date() }) {
+export function agentReservation({ config, data, role, model, request, inputTokens, now = new Date() }) {
   if (!AGENT_ROLES.includes(role)) throw new Error('Unknown review agent');
   const options = config.review.v3;
   const price = options.pricing?.[model];
   if (!price || ![price.input, price.output].every((n) => Number.isFinite(n) && n >= 0)) return { allowed: false, reason: 'model_pricing_missing' };
-  const input = countRequestTokens(model, request);
+  const input = inputTokens ?? countRequestTokens(model, request);
+  if (!Number.isSafeInteger(input) || input < 0) throw new Error('Invalid provider token count');
   if (input > options.agentInputTokens) return { allowed: false, reason: 'agent_input_limit' };
   const tokens = input + request.max_output_tokens;
   // USD / million tokens equals micro-USD / token. Round reservations upwards.

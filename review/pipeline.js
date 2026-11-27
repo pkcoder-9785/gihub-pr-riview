@@ -101,12 +101,23 @@ export async function runV3Review({ step, client, store, config, data, args, sna
     const executeAgent = async (role, previousResults = []) => {
       const packet = await loadPacket();
       const priorFindings = role === 'architecture' ? await store.getPriorFindings(data.repositoryId, data.prNumber) : [];
-      return runAgent({ client: getAI(config.openai), store, config, data, snapshot, runId, role, packet, previousResults, priorFindings, isFresh });
+      const client = getAI(config.openai);
+      const countInput = config.review.v3.astraSonnet
+        ? async ({ model, instructions, input, text, reasoning }) => {
+          const result = await client.responses.inputTokens.count(
+            { model, instructions, input, text, reasoning },
+            { timeout: config.review.v3.timeoutMs },
+          );
+          return result.input_tokens;
+        }
+        : undefined;
+      return runAgent({ client, countInput, store, config, data, snapshot, runId, role, packet, previousResults, priorFindings, isFresh });
     };
-    const first = await Promise.all([
-      step.run('context-dependency-agent', () => executeAgent('context-dependency')),
-      step.run('security-logic-agent', () => executeAgent('security-logic')),
-    ]);
+    const reviewerRoles = config.review.v3.astraSonnet
+      ? ['security-logic']
+      : ['context-dependency', 'security-logic'];
+    const first = await Promise.all(reviewerRoles.map((role) =>
+      step.run(`${role}-agent`, () => executeAgent(role))));
     if (first.some((result) => result.status === 'skipped_stale')) return { status: 'skipped_stale' };
     if (first.some((result) => result.status !== 'complete')) return { status: 'incomplete', coverage: collected.coverage };
     const architecture = await step.run('architecture-agent', () => executeAgent('architecture', first));
@@ -114,9 +125,13 @@ export async function runV3Review({ step, client, store, config, data, args, sna
     const aggregateRef = await step.run('aggregate', async () => {
       const id = artifactId('candidates', runId, reviewId);
       await store.putAnalysisArtifact(id, data.repositoryId, snapshot.base, snapshot.head, {
-        candidates: [...first, architecture].flatMap((result) => result.candidates),
+        candidates: config.review.v3.astraSonnet
+          ? architecture.candidates
+          : [...first, architecture].flatMap((result) => result.candidates),
         revisions: architecture.revisions,
-        summary: sanitize(first[0].summary || 'Three-agent review completed.'),
+        summary: config.review.v3.astraSonnet
+          ? 'Astra verified findings from the Sol reviewer.'
+          : sanitize(first[0].summary || 'Three-agent review completed.'),
         partial: [...first, architecture].some((result) => result.partial),
         usage: [...first, architecture].every((r) => r.usage) ? [...first, architecture].reduce((sum, r) => sum + r.usage.tokens, 0) : null,
       });
@@ -129,7 +144,7 @@ export async function runV3Review({ step, client, store, config, data, args, sna
       const verified = verifyFindings({ candidates: aggregated.candidates, packet, priorFindings: prior, revisions: aggregated.revisions, maxFindings: config.review.maxFindings });
       const id = artifactId('verified', runId, reviewId);
       const coverage = { ...collected.coverage, partial: collected.coverage.partial || aggregated.partial || packet.coverage.partial };
-      const result = { status: 'complete', summary: `${aggregated.summary}\nThree agents ran. ${coverage.partial ? 'Analysis is partial.' : 'Available analysis completed.'} ${verified.states.filter((s) => ['changed', 'still_present'].includes(s.state)).length} previously reported findings tracked without reposting.`,
+      const result = { status: 'complete', summary: `${aggregated.summary}\n${coverage.partial ? 'Analysis is partial.' : 'Available analysis completed.'} ${verified.states.filter((s) => ['changed', 'still_present'].includes(s.state)).length} previously reported findings tracked without reposting.`,
         findings: verified.findings, fileChanges: [], usage: aggregated.usage, coverage };
       await store.saveFindingStates(data.repositoryId, data.prNumber, snapshot.head, reviewId, verified.states);
       await store.putAnalysisArtifact(id, data.repositoryId, snapshot.base, snapshot.head, result);
