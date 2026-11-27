@@ -57,10 +57,10 @@ const envSchema = z
         return z.record(z.string(), z.object({ input: z.number().nonnegative(), output: z.number().nonnegative() }).strict()).parse(JSON.parse(value));
       } catch { ctx.addIssue({ code: 'custom', message: 'Expected model input/output USD per million tokens' }); return z.NEVER; }
     }),
-    REVIEW_V3_AGENT_INPUT_TOKENS: positiveInteger(8000).pipe(z.number().max(24000)),
+    REVIEW_V3_AGENT_INPUT_TOKENS: positiveInteger(24000).pipe(z.number().max(24000)),
     REVIEW_V3_AGENT_OUTPUT_TOKENS: positiveInteger(1500).pipe(z.number().max(4000)),
-    REVIEW_V3_AGENT_COST_MICROS: positiveInteger(100000),
-    REVIEW_V3_PR_COST_MICROS: positiveInteger(300000),
+    REVIEW_V3_AGENT_COST_MICROS: positiveInteger(500000),
+    REVIEW_V3_PR_COST_MICROS: positiveInteger(1000000),
     REVIEW_V3_MONTHLY_COST_MICROS: positiveInteger(30000000),
     REVIEW_V3_TEST_BUDGET_BYPASS: z.enum(['true', 'false']).default('false'),
     REVIEW_V3_TIMEOUT_MS: positiveInteger(90000).pipe(z.number().max(180000)),
