@@ -31,7 +31,7 @@ export async function buildEvidencePacket({ context, impact, snapshot, fetchFile
   let chars = 0, truncated = false;
   const add = (item) => {
     if (!isEligibleManifestFile(item.file) || redact(item.file) !== item.file) { truncated = true; return null; }
-    const snippet = redact(item.snippet).slice(0, 1800);
+    const snippet = item.kind === 'symbol' ? redact(item.snippet) : redact(item.snippet).slice(0, 1800);
     const id = hash(item.kind, item.file, item.sha, item.line, item.side, item.symbolKey, snippet);
     const existing = items.find((entry) => entry.id === id);
     if (existing) return id;
@@ -69,8 +69,29 @@ export async function buildEvidencePacket({ context, impact, snapshot, fetchFile
     const source = await load(change.file, sha);
     if (typeof source !== 'string') { truncated = true; continue; }
     const lines = source.split(/\r?\n/);
+    const body = lines.slice(symbol.range.start.line - 1, symbol.range.end.line);
+    const overhead = change.file.length + symbol.symbolKey.length + 200;
+    const available = Math.max(0, maxChars - chars - overhead);
+    let snippet = redact(body.join('\n'));
+    let omittedLines = 0;
+    if (snippet.length > available) {
+      truncated = true;
+      // Preserve the signature and the end instead of silently keeping only a prefix.
+      let keep = Math.min(body.length, 20);
+      do {
+        const front = Math.ceil(keep / 2);
+        const back = Math.floor(keep / 2);
+        omittedLines = body.length - keep;
+        snippet = redact([...body.slice(0, front),
+          `...omitted ${omittedLines} lines...`,
+          ...(back ? body.slice(-back) : [])].join('\n'));
+        if (snippet.length <= available) break;
+        keep--;
+      } while (keep >= 0);
+      if (snippet.length > available) continue;
+    }
     add({ kind: 'symbol', file: change.file, sha, side: removed ? 'LEFT' : 'RIGHT', line: symbol.range.start.line,
-      column: symbol.range.start.column, symbolKey: symbol.symbolKey, snippet: lines.slice(symbol.range.start.line - 1, Math.min(symbol.range.end.line, symbol.range.start.line + 18)).join('\n') });
+      column: symbol.range.start.column, symbolKey: symbol.symbolKey, omittedLines, snippet });
   }
   for (const caller of impact.affectedCallers || []) {
     if (caller.resolution !== 'confirmed' || !caller.path?.length) continue;
@@ -101,7 +122,7 @@ export async function buildEvidencePacket({ context, impact, snapshot, fetchFile
 export function selectAgentEvidence(packet, role) {
   // Shared facts have stable IDs. Specialists receive compact excerpts, never
   // repeated whole diffs/ASTs or unrestricted repository context.
-  const items = packet.items.map((item) => ({ ...item, snippet: item.snippet.slice(0, role === 'context-dependency' ? 900 : 1400) }));
+  const items = packet.items.map((item) => ({ ...item, snippet: item.kind === 'symbol' ? item.snippet : item.snippet.slice(0, role === 'context-dependency' ? 900 : 1400) }));
   return { ...packet, items };
 }
 

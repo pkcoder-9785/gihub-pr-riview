@@ -455,3 +455,7 @@ Deployment precheck: 141 local tests passed, zero failed, one database integrati
 Production smoke: commit aac47d4 deploy hua. Dono V3 flags set karke Railway redeploy SUCCESS hua. Portfolio PR #2 ka fixture commit f1cf3cb push hua. Railway par webhook 202 aur Inngest callbacks 206 dekhe. Latest GitHub check mein sirf purane head ka review mila. Sol aur Astra ka final run output pending hai.
 
 V3 smoke ka resolve-index-base step PostgreSQL duplicate conflict error par fail hua. Edge upsert se pehle same key ki last entry rakhi. Synthetic batch check aur git diff --check pass.
+
+Railway deploy c58b677 SUCCESS. Portfolio PR #2 head 62c905e par bot review post hua aur review body mein Astra verified findings from the Sol reviewer summary verify hui.
+
+Changed-symbol context now includes full function/class bodies within packet budget. Removed both 19-line cutoff and agent symbol-prefix clipping. Oversized bodies preserve beginning/end with omitted-line markers. Focused V3 tests and full-body forwarding regression passed. Provider token trimming still bounds final input.
