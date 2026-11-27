@@ -89,12 +89,15 @@ export class AnalysisStore {
   }
 
   async insertAnalysisEdges(c, key, edges) {
+    // PostgreSQL cannot update the same conflict key twice in one INSERT.
+    // Keep the last entry for each key, matching sequential upsert behavior.
+    const uniqueEdges = new Map(edges.map((edge) => [edge.edge_key, edge]));
     await c.query(`INSERT INTO repo_dependency_edges(repository_id,commit_sha,edge_key,edge_type,resolution,source_file,
       source_symbol_key,call_start_byte,call_line,target_file,target_symbol_key,target_name,evidence)
       SELECT $1,$2,x->>'edge_key',x->>'type',x->>'resolution',x->>'file',COALESCE(x->>'callerSymbolKey',''),x->>'byteOffset',(x->>'line')::integer,
         COALESCE(x->'target'->>'file',''),COALESCE(x->>'targetSymbolKey',''),COALESCE(x->'target'->'symbol'->>'name',''),x
       FROM jsonb_array_elements($3::jsonb) AS t(x)
-      ON CONFLICT(repository_id,commit_sha,edge_key) DO UPDATE SET evidence=EXCLUDED.evidence`, [...key, JSON.stringify(edges)]);
+      ON CONFLICT(repository_id,commit_sha,edge_key) DO UPDATE SET evidence=EXCLUDED.evidence`, [...key, JSON.stringify([...uniqueEdges.values()])]);
   }
 
   async failIndexBuild(repositoryId, commitSha, owner) {

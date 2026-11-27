@@ -451,3 +451,7 @@ Is mode mein provider token counts budget reservation se pehle use hote hain. As
 First reviewer ko Sonnet se Sol par switch kiya. Anthropic adapter future reuse ke liye retained hai. Existing feature flag ka naam compatibility ke liye same hai.
 
 Deployment precheck: 141 local tests passed, zero failed, one database integration check skipped. GitHub production smoke check pending.
+
+Production smoke: commit aac47d4 deploy hua. Dono V3 flags set karke Railway redeploy SUCCESS hua. Portfolio PR #2 ka fixture commit f1cf3cb push hua. Railway par webhook 202 aur Inngest callbacks 206 dekhe. Latest GitHub check mein sirf purane head ka review mila. Sol aur Astra ka final run output pending hai.
+
+V3 smoke ka resolve-index-base step PostgreSQL duplicate conflict error par fail hua. Edge upsert se pehle same key ki last entry rakhi. Synthetic batch check aur git diff --check pass.
