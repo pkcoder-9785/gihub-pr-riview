@@ -74,7 +74,7 @@ No source text should be copied into summary or explanations; reference source b
 export async function runAgent({ client, countInput, store, config, data, snapshot, runId, role, packet, previousResults, priorFindings, isFresh }) {
   const model = config.review.v3.models?.[role] || config.openai.model;
   const price = config.review.v3.pricing?.[model];
-  const affordableInput = price?.input > 0
+  const affordableInput = !config.review.v3.testBudgetBypass && price?.input > 0
     ? Math.floor((config.review.v3.agentCostMicros - config.review.v3.agentOutputTokens * price.output) / price.input)
     : config.review.v3.agentInputTokens;
   const inputLimit = Math.min(config.review.v3.agentInputTokens, affordableInput);

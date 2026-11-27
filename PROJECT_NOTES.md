@@ -459,3 +459,7 @@ V3 smoke ka resolve-index-base step PostgreSQL duplicate conflict error par fail
 Railway deploy c58b677 SUCCESS. Portfolio PR #2 head 62c905e par bot review post hua aur review body mein Astra verified findings from the Sol reviewer summary verify hui.
 
 Changed-symbol context now includes full function/class bodies within packet budget. Removed both 19-line cutoff and agent symbol-prefix clipping. Oversized bodies preserve beginning/end with omitted-line markers. Focused V3 tests and full-body forwarding regression passed. Provider token trimming still bounds final input.
+
+Full-body context fix commit 863dd2b Railway deployment SUCCESS. PR #2 comment-only fixture commit 5d3fed1 triggered fresh review. Railway run 01M8E1FKM92YGT602QPP7QMRYZ returned incomplete, usage null. No review published for this head. Generic status does not expose underlying agent/budget outcome.
+
+Temporary V3 testing mode: REVIEW_V3_TEST_BUDGET_BYPASS=true bypasses cost caps and daily/monthly budget scopes. Atomic reservation IDs/results and usage metrics remain recorded. Configured input/output token limits still apply. Default false. User explicitly requested temporary budget bypass for testing.

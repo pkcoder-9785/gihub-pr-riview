@@ -62,6 +62,7 @@ const envSchema = z
     REVIEW_V3_AGENT_COST_MICROS: positiveInteger(100000),
     REVIEW_V3_PR_COST_MICROS: positiveInteger(300000),
     REVIEW_V3_MONTHLY_COST_MICROS: positiveInteger(30000000),
+    REVIEW_V3_TEST_BUDGET_BYPASS: z.enum(['true', 'false']).default('false'),
     REVIEW_V3_TIMEOUT_MS: positiveInteger(90000).pipe(z.number().max(180000)),
 
     INNGEST_EVENT_KEY: z.string().trim().optional(),
@@ -170,6 +171,7 @@ export function loadConfig(environment = process.env) {
         agentCostMicros: env.REVIEW_V3_AGENT_COST_MICROS,
         prCostMicros: env.REVIEW_V3_PR_COST_MICROS,
         monthlyCostMicros: env.REVIEW_V3_MONTHLY_COST_MICROS,
+        testBudgetBypass: env.REVIEW_V3_TEST_BUDGET_BYPASS === 'true',
         timeoutMs: env.REVIEW_V3_TIMEOUT_MS,
       },
     },

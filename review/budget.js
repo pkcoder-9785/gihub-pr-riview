@@ -13,7 +13,7 @@ export function agentReservation({ config, data, role, model, request, inputToke
   const tokens = input + request.max_output_tokens;
   // USD / million tokens equals micro-USD / token. Round reservations upwards.
   const costMicros = Math.ceil(input * price.input + request.max_output_tokens * price.output);
-  if (!Number.isSafeInteger(costMicros) || costMicros > options.agentCostMicros) return { allowed: false, reason: 'agent_cost_limit' };
+  if (!Number.isSafeInteger(costMicros) || !options.testBudgetBypass && costMicros > options.agentCostMicros) return { allowed: false, reason: 'agent_cost_limit' };
   const day = now.toISOString().slice(0, 10), month = day.slice(0, 7);
   const repo = String(data.repositoryId), pr = `pr:${repo}:${data.prNumber}`;
   const scopes = [
@@ -23,7 +23,7 @@ export function agentReservation({ config, data, role, model, request, inputToke
     { period: day, name: `${pr}:${role}`, tokens: options.agentInputTokens + options.agentOutputTokens, costMicros: options.agentCostMicros },
     { period: month, name: 'global-monthly', tokens: unlimited, costMicros: options.monthlyCostMicros },
   ];
-  return { allowed: true, tokens, costMicros, scopes, price };
+  return { allowed: true, tokens, costMicros, scopes: options.testBudgetBypass ? [] : scopes, price };
 }
 
 export function actualAgentUsage(response, price) {
